@@ -16,7 +16,6 @@ Commands:
   console         Attach to the serial console (Ctrl+] to exit)
   reset           Destroy the VM and recreate it from the clean base image
   destroy         Remove the VM and all associated state (keeps base image)
-  proxy-service   Manage the LLM port proxy (subcommands: status|restart|disable)
 
 Environment overrides:
   VM_NAME             (default: sandbox-vm)
@@ -29,8 +28,6 @@ Environment overrides:
   VM_IP               (default: 192.168.122.50)
   BASE_IMAGE_URL      (default: ubuntu 24.04 cloud image)
   SSH_PUBLIC_KEY      (path to public key to inject into the guest)
-  LLM_HOST            (default: 127.0.0.1)
-  LLM_PORT            (default: 8000)
 
 Examples:
   ./sandbox-vm.sh setup
@@ -50,8 +47,6 @@ VM_MAC=${VM_MAC:-52:54:00:ab:cd:01}
 VM_IP=${VM_IP:-192.168.122.50}
 BASE_IMAGE_URL=${BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}
 SSH_PUBLIC_KEY_PATH=${SSH_PUBLIC_KEY:-}
-LLM_HOST=${LLM_HOST:-127.0.0.1}
-LLM_PORT=${LLM_PORT:-8000}
 
 if [[ -n "${SUDO_USER:-}" ]]; then
   INVOKING_USER="${SUDO_USER}"
@@ -100,7 +95,6 @@ SEED_IMAGE="${SANDBOX_DIR}/seed.iso"
 CLOUD_INIT_DIR="${SANDBOX_DIR}/cloud-init"
 USER_DATA_FILE="${CLOUD_INIT_DIR}/user-data.yaml"
 META_DATA_FILE="${CLOUD_INIT_DIR}/meta-data.yaml"
-SOCAT_SERVICE=/etc/systemd/system/sandbox-llm-proxy.service
 
 # SHA-512 hash for the fallback sandbox user password "sandbox"
 SANDBOX_PASSWORD_HASH='$6$VOX0KkCjb6wYYhs5$VAaVnXRdBQ4VMqU.ETpntF89BMYSkomscUqJxvVSE9aB/8A6XmfvQNay26KRkD6HEGzWzBK74.xhhyWgEFYaq.'
@@ -154,8 +148,7 @@ ensure_packages() {
     cloud-image-utils \
     qemu-utils \
     dnsmasq-base \
-    bridge-utils \
-    socat
+    bridge-utils
 }
 
 ensure_libvirtd() {
@@ -383,50 +376,6 @@ EOF
   cloud-localds "${tmp}" "${USER_DATA_FILE}" "${META_DATA_FILE}"
   ${SUDO} mv "${tmp}" "${SEED_IMAGE}"
   ${SUDO} chown "$(libvirt_owner)" "${SEED_IMAGE}"
-}
-
-ensure_proxy_service() {
-  local host_ip
-  host_ip=$(get_network_gateway_ip)
-
-  if [[ -z "${host_ip}" ]]; then
-    log "ERROR: Unable to determine libvirt host IP for network '${VM_NETWORK}'."
-    exit 1
-  fi
-
-  log "Configuring LLM proxy service (binds ${host_ip}:${LLM_PORT} -> ${LLM_HOST}:${LLM_PORT})..."
-  ${SUDO} tee "${SOCAT_SERVICE}" >/dev/null <<EOF
-[Unit]
-Description=Expose host LLM service to libvirt guests
-After=libvirtd.service network-online.target
-Requires=libvirtd.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/socat TCP-LISTEN:${LLM_PORT},bind=${host_ip},reuseaddr,fork TCP:${LLM_HOST}:${LLM_PORT}
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  ${SUDO} systemctl daemon-reload
-  ${SUDO} systemctl enable --now sandbox-llm-proxy.service
-}
-
-get_network_gateway_ip() {
-  local ip
-  ip=$(${SUDO} virsh net-dumpxml "${VM_NETWORK}" 2>/dev/null | awk -F"'" '/ip address=/ {print $2; exit}')
-  if [[ -n "${ip}" ]]; then
-    echo "${ip}"
-    return
-  fi
-  if ip=$(/sbin/ip -4 addr show dev virbr0 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1); then
-    echo "${ip}"
-    return
-  fi
-  return 1
 }
 
 define_vm() {
@@ -725,18 +674,6 @@ reset_vm() {
   ensure_ssh_config_entry
 }
 
-proxy_service_status() {
-  ${SUDO} systemctl status sandbox-llm-proxy.service || true
-}
-
-proxy_service_restart() {
-  ${SUDO} systemctl restart sandbox-llm-proxy.service
-}
-
-proxy_service_disable() {
-  ${SUDO} systemctl disable --now sandbox-llm-proxy.service
-}
-
 command_setup() {
   validate_virtualization
   ensure_packages
@@ -745,7 +682,6 @@ command_setup() {
   download_base_image
   create_overlay_disk
   generate_cloud_init
-  ensure_proxy_service
   define_vm
   ensure_hosts_entry
   ensure_ssh_config_entry
@@ -754,7 +690,6 @@ command_setup() {
   log "Next steps:"
   log "  - Run './sandbox-vm.sh start' to boot the VM."
   log "  - Use 'virsh console ${VM_NAME}' or 'ssh ${VM_HOSTNAME}' (user: ${SANDBOX_USERNAME}, password: sandbox)."
-  log "  - Access host LLM from guest at http://$(get_network_gateway_ip):${LLM_PORT}/"
 }
 
 case "${COMMAND}" in
@@ -778,19 +713,6 @@ case "${COMMAND}" in
     ;;
   destroy)
     destroy_vm
-    ;;
-  proxy-service)
-    shift || true
-    subcmd=${1:-status}
-    case "${subcmd}" in
-      status) proxy_service_status ;;
-      restart) proxy_service_restart ;;
-      disable) proxy_service_disable ;;
-      *)
-        log "Unknown proxy-service subcommand '${subcmd}' (expected status|restart|disable)."
-        exit 1
-        ;;
-    esac
     ;;
   *)
     log "Unknown command '${COMMAND}'."
