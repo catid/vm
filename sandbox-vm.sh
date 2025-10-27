@@ -559,6 +559,7 @@ ensure_ssh_config_entry() {
 Host ${VM_HOSTNAME}
   HostName ${VM_IP}
   User ${SANDBOX_USERNAME}
+  ForwardAgent yes
 EOF
 
   if [[ "${EUID}" -eq 0 ]]; then
@@ -720,6 +721,8 @@ reset_vm() {
   create_overlay_disk
   generate_cloud_init
   define_vm
+  ensure_hosts_entry
+  ensure_ssh_config_entry
 }
 
 proxy_service_status() {
